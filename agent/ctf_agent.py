@@ -1,20 +1,22 @@
+import json
 import time
+import re
 
 from models.llm import LLM
 from rag.search import search
 
+from tools.router import execute_tool
+
+from agent.state import CTFState
+from agent.recon import ReconStrategy
+
 
 # ==========================================
-# MODEL CONFIGURATION
+# CONFIGURATION
 # ==========================================
 
-# Development:
-MODEL_PROVIDER = "ollama"
-MODEL_NAME = "qwen3:8b"
-
-# Competition/cloud:
-# MODEL_PROVIDER = "deepseek"
-# MODEL_NAME = "deepseek-chat"
+MODEL_PROVIDER = "bedrock"
+MODEL_NAME = "deepseek.v3.2"
 
 
 # ==========================================
@@ -22,48 +24,219 @@ MODEL_NAME = "qwen3:8b"
 # ==========================================
 
 SYSTEM_PROMPT = """
-You are CTF Brain, an expert Capture The Flag
-player and cybersecurity assistant.
+You are CTF Brain.
 
-Your primary goal is to help solve authorized
-CTF challenges and security labs.
+You are an expert Capture The Flag
+and authorized security-lab assistant.
 
-Use the retrieved knowledge as your primary
-source when it is relevant.
+Your job is to investigate CTF targets,
+use available tools when necessary,
+reason over tool results, and ultimately
+help identify flags.
 
-Rules:
+Only operate against authorized CTF
+targets and security labs.
 
-1. Analyze the challenge carefully.
+AVAILABLE TOOLS:
 
-2. Use the supplied knowledge when relevant.
+1. nmap
 
-3. If the knowledge is incomplete, combine it
-   with your cybersecurity knowledge.
+Arguments:
+{
+    "target": "IP or hostname",
+    "ports": "optional ports"
+}
 
-4. Explain why a technique or command is
-   appropriate.
+2. http
 
-5. Prefer practical commands and examples.
+Arguments:
+{
+    "url": "http://target"
+}
 
-6. Never claim that you executed a command
-   unless a tool actually executed it.
+3. web_enum
 
-7. Clearly distinguish retrieved information
-   from your own reasoning.
+Arguments:
+{
+    "url": "http://target"
+}
 
-8. Think like an experienced CTF player.
+4. web_crawl
 
-9. When multiple approaches are possible,
-   compare them and recommend the most
-   promising one.
+Arguments:
+{
+    "url": "http://target"
+}
 
-10. Focus on authorized CTF environments,
-    challenge machines, and security labs.
+Purpose:
+Crawl the target website, follow discovered
+same-host links, and collect pages, links,
+forms, and scripts.
+
+Use web_crawl when web_enum has discovered
+interesting links or when deeper website
+mapping is useful.
+
+5. web_discovery
+
+Arguments:
+{
+    "url": "http://target"
+}
+
+6. web_params
+
+Arguments:
+{
+    "mode": "discover|test|api",
+    "url": "http://target"
+}
+
+7. shell
+
+Arguments:
+{
+    "command": "command"
+}
+
+
+DECISION FORMAT:
+
+For a tool action:
+
+{
+    "decision": "tool",
+    "tool": "nmap",
+    "arguments": {
+        "target": "127.0.0.1",
+        "ports": "22"
+    }
+}
+
+For a final answer:
+
+{
+    "decision": "final",
+    "answer": "your answer"
+}
+
+
+RULES:
+
+1. Analyze the current state.
+
+2. Use RAG knowledge when relevant.
+
+3. Use tools when actual target information
+   is required.
+
+4. Never claim that a command was executed
+   unless a tool result confirms it.
+
+5. Prefer one useful tool action at a time.
+
+6. Do not repeat an action already performed
+   unless new information justifies it.
+
+7. When HTTP is discovered, use web_enum
+   to understand the initial application.
+
+8. If web_enum discovers interesting links,
+   use web_crawl when deeper mapping is useful.
+
+9. After crawling, inspect discovered pages,
+   forms, scripts, and endpoints.
+
+10. Use web_discovery when additional hidden
+    paths may be useful.
+
+11. Use web_params when parameters or APIs
+    need investigation.
+
+12. Use shell only when local command execution
+    is appropriate for the authorized CTF.
+
+13. If a flag is discovered, stop investigating.
+
+14. Clearly distinguish observed results
+    from reasoning.
+
+15. Stay focused on the CTF objective.
+
+16. Avoid repeating tools unnecessarily.
+
+17. Prefer the smallest useful number of
+    tool calls.
+
+18. Return valid JSON for every decision.
 """
 
 
 # ==========================================
-# CONTEXT BUILDER
+# JSON PARSER
+# ==========================================
+
+def parse_json(text):
+
+    text = text.strip()
+
+    try:
+        return json.loads(text)
+
+    except json.JSONDecodeError:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start != -1 and end != -1:
+
+        candidate = text[start:end + 1]
+
+        try:
+            return json.loads(candidate)
+
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+# ==========================================
+# FLAG DETECTOR
+# ==========================================
+
+def detect_flags(value):
+
+    if not isinstance(value, str):
+        return []
+
+    patterns = [
+        r"flag\{[^}]+\}",
+        r"FLAG\{[^}]+\}",
+        r"CTF\{[^}]+\}",
+        r"picoCTF\{[^}]+\}",
+    ]
+
+    flags = []
+
+    for pattern in patterns:
+
+        matches = re.findall(
+            pattern,
+            value,
+        )
+
+        for match in matches:
+
+            if match not in flags:
+                flags.append(match)
+
+    return flags
+
+
+# ==========================================
+# RAG CONTEXT
 # ==========================================
 
 def build_context(documents):
@@ -77,7 +250,7 @@ def build_context(documents):
 
         source = doc.metadata.get(
             "source",
-            "unknown"
+            "unknown",
         )
 
         parts.append(
@@ -96,124 +269,406 @@ Content:
 
 
 # ==========================================
-# CTF QUESTION
+# ASK AGENT
 # ==========================================
 
-def ask(question):
+def ask(question, state, recon):
 
     total_start = time.time()
 
-    # ------------------------------
-    # RAG SEARCH
-    # ------------------------------
+    # ======================================
+    # RAG
+    # ======================================
 
-    print("\n[1] Searching knowledge base...")
+    print(
+        "\n[1] Searching knowledge base..."
+    )
 
     search_start = time.time()
 
     documents = search(
         question,
-        k=3
+        k=3,
     )
 
-    search_time = time.time() - search_start
+    search_time = (
+        time.time()
+        - search_start
+    )
 
     print(
         f"[2] Search completed in "
         f"{search_time:.2f}s"
     )
 
-    # ------------------------------
-    # BUILD CONTEXT
-    # ------------------------------
-
     context = build_context(
         documents
     )
 
-    # ------------------------------
-    # BUILD PROMPT
-    # ------------------------------
+    # ======================================
+    # AGENT LOOP
+    # ======================================
 
-    prompt = f"""
-You are solving a CTF-related question.
+    max_steps = 8
 
-Relevant knowledge:
+    for step in range(1, max_steps + 1):
 
-{context}
+        state_json = json.dumps(
+            state.summary(),
+            indent=2,
+        )
 
-================================
+        strategy = recon.prompt_context()
 
-User question:
+        prompt = f"""
+USER QUESTION:
 
 {question}
 
-================================
 
-Using the knowledge above and your own
-cybersecurity reasoning, provide the best
-practical answer.
+========================================
 
-If the retrieved knowledge does not fully
-answer the question, say what is missing
-and continue using your own knowledge.
+RETRIEVED KNOWLEDGE:
+
+{context}
+
+
+========================================
+
+CURRENT CTF STATE:
+
+{state_json}
+
+
+========================================
+
+{strategy}
+
+
+========================================
+
+TASK:
+
+Analyze the current situation.
+
+Decide whether another tool action is
+necessary.
+
+Available tools:
+
+- nmap
+- http
+- web_enum
+- web_crawl
+- web_discovery
+- web_params
+- shell
+
+If a tool is required, return JSON:
+
+{{
+    "decision": "tool",
+    "tool": "web_crawl",
+    "arguments": {{
+        "url": "http://127.0.0.1:8000"
+    }}
+}}
+
+If no tool is required, return JSON:
+
+{{
+    "decision": "final",
+    "answer": "your answer"
+}}
+
+Return ONLY valid JSON.
 """
 
-    # ------------------------------
-    # MODEL
-    # ------------------------------
+        # ==================================
+        # MODEL
+        # ==================================
 
-    print(
-        f"[3] Sending request to "
-        f"{MODEL_PROVIDER}:{MODEL_NAME}..."
+        print(
+            f"\n[3.{step}] Asking DeepSeek..."
+        )
+
+        llm_start = time.time()
+
+        llm = LLM(
+            provider=MODEL_PROVIDER,
+            model=MODEL_NAME,
+        )
+
+        response = llm.generate(
+            prompt,
+            system=SYSTEM_PROMPT,
+        )
+
+        llm_time = (
+            time.time()
+            - llm_start
+        )
+
+        print(
+            f"[3.{step}] Model response "
+            f"in {llm_time:.2f}s"
+        )
+
+        # ==================================
+        # PARSE DECISION
+        # ==================================
+
+        decision = parse_json(response)
+
+        if not decision:
+
+            print(
+                "[!] Invalid JSON from model."
+            )
+
+            print(
+                "[!] Raw response:"
+            )
+
+            print(response)
+
+            return response
+
+        decision_type = decision.get(
+            "decision"
+        )
+
+        print(
+            f"[4.{step}] Decision: "
+            f"{decision_type}"
+        )
+
+        # ==================================
+        # FINAL ANSWER
+        # ==================================
+
+        if decision_type == "final":
+
+            answer = decision.get(
+                "answer",
+                "",
+            )
+
+            flags = detect_flags(
+                answer
+            )
+
+            for flag in flags:
+                state.add_flag(flag)
+
+            total_time = (
+                time.time()
+                - total_start
+            )
+
+            print(
+                f"\n[5] Total time: "
+                f"{total_time:.2f}s"
+            )
+
+            return answer
+
+        # ==================================
+        # TOOL DECISION
+        # ==================================
+
+        if decision_type != "tool":
+
+            return (
+                "Invalid agent decision."
+            )
+
+        tool = decision.get(
+            "tool"
+        )
+
+        arguments = decision.get(
+            "arguments",
+            {},
+        )
+
+        print(
+            f"[4.{step}] Tool: {tool}"
+        )
+
+        print(
+            f"[4.{step}] Arguments: "
+            f"{arguments}"
+        )
+
+        # ==================================
+        # DUPLICATE PREVENTION
+        # ==================================
+
+        if state.action_already_done(
+            tool,
+            arguments,
+        ):
+
+            print(
+                "[!] Duplicate action "
+                "blocked."
+            )
+
+            context += """
+
+The requested tool action has already
+been performed.
+
+Do NOT repeat it.
+
+Use the existing state and results
+to decide the next useful action.
+"""
+
+            continue
+
+        # ==================================
+        # EXECUTE TOOL
+        # ==================================
+
+        tool_start = time.time()
+
+        try:
+
+            result = execute_tool(
+                tool,
+                arguments,
+            )
+
+        except Exception as error:
+
+            result = {
+                "error": str(error),
+            }
+
+        tool_time = (
+            time.time()
+            - tool_start
+        )
+
+        print(
+            f"[5.{step}] Tool completed "
+            f"in {tool_time:.2f}s"
+        )
+
+        # ==================================
+        # SAVE RESULT
+        # ==================================
+
+        state.process_result(
+            tool,
+            arguments,
+            result,
+        )
+
+        serialized = json.dumps(
+            result,
+            indent=2,
+            default=str,
+        )
+
+        # ==================================
+        # FLAG DETECTION
+        # ==================================
+
+        flags = detect_flags(
+            serialized
+        )
+
+        if flags:
+
+            for flag in flags:
+                state.add_flag(flag)
+
+            print(
+                "\n[+] FLAG FOUND!"
+            )
+
+            for flag in flags:
+
+                print(
+                    f"[+] {flag}"
+                )
+
+            return (
+                "Flag discovered:\n\n"
+                + "\n".join(flags)
+                + "\n\nEvidence:\n"
+                + serialized
+            )
+
+        # ==================================
+        # ADD TOOL RESULT TO CONTEXT
+        # ==================================
+
+        context += f"""
+
+========================================
+
+NEW TOOL RESULT
+
+Tool:
+{tool}
+
+Arguments:
+{json.dumps(
+    arguments,
+    indent=2,
+)}
+
+Result:
+{serialized}
+
+========================================
+"""
+
+    # ======================================
+    # MAX STEPS
+    # ======================================
+
+    return (
+        "Investigation reached the "
+        "maximum number of agent steps."
     )
-
-    llm_start = time.time()
-
-    llm = LLM(
-        provider=MODEL_PROVIDER,
-        model=MODEL_NAME
-    )
-
-    answer = llm.generate(
-        prompt,
-        system=SYSTEM_PROMPT
-    )
-
-    llm_time = time.time() - llm_start
-
-    print(
-        f"[4] Model completed in "
-        f"{llm_time:.2f}s"
-    )
-
-    total_time = time.time() - total_start
-
-    print(
-        f"[5] Total time: "
-        f"{total_time:.2f}s"
-    )
-
-    return answer
 
 
 # ==========================================
-# CLI
+# MAIN
 # ==========================================
 
 def main():
 
-    print("""
+    print(
+        """
 ========================================
-             CTF BRAIN
-       RAG + LLM Prototype
+              CTF BRAIN
+        RAG + DeepSeek + Tools
 ========================================
+
+Provider:
+Amazon Bedrock
 
 Model:
-Qwen3:8B / Ollama
+DeepSeek V3.2
+
+Tools:
+- Nmap
+- HTTP
+- Web Enumeration
+- Web Crawling
+- Web Discovery
+- Web Parameters
+- Shell
 
 Type 'exit' or 'quit' to leave.
-""")
+"""
+    )
 
     while True:
 
@@ -223,17 +678,25 @@ Type 'exit' or 'quit' to leave.
 
         if question.lower() in (
             "exit",
-            "quit"
+            "quit",
         ):
             break
 
         if not question.strip():
             continue
 
+        state = CTFState()
+
+        recon = ReconStrategy(
+            state
+        )
+
         try:
 
             answer = ask(
-                question
+                question,
+                state,
+                recon,
             )
 
             print(

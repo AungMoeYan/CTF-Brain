@@ -1,0 +1,538 @@
+import re
+from urllib.parse import urljoin, urlparse, parse_qs
+
+import requests
+
+
+TIMEOUT = 5
+
+USER_AGENT = "CTF-Brain/1.0 (authorized-security-testing)"
+
+COMMON_PATHS = [
+    "/robots.txt",
+    "/sitemap.xml",
+    "/.git/HEAD",
+    "/.env",
+    "/admin",
+    "/login",
+    "/dashboard",
+    "/api",
+    "/api/",
+    "/uploads/",
+    "/upload",
+    "/backup/",
+    "/backups/",
+    "/config/",
+    "/server-status",
+    "/phpinfo.php",
+    "/test",
+    "/dev",
+    "/debug",
+]
+
+COMMON_FILES = [
+    "/index.php",
+    "/index.html",
+    "/login.php",
+    "/admin.php",
+    "/config.php",
+    "/backup.zip",
+    "/backup.tar.gz",
+    "/db.sql",
+]
+
+
+def normalize_url(url):
+    url = url.strip()
+
+    if not url.startswith(("http://", "https://")):
+        url = "http://" + url
+
+    return url.rstrip("/")
+
+
+def request(
+    url,
+    method="GET",
+    allow_redirects=True,
+    **kwargs,
+):
+    headers = kwargs.pop("headers", {})
+
+    headers.setdefault(
+        "User-Agent",
+        USER_AGENT,
+    )
+
+    kwargs["timeout"] = TIMEOUT
+
+    try:
+        response = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            allow_redirects=allow_redirects,
+            **kwargs,
+        )
+
+        return response, None
+
+    except requests.RequestException as error:
+        return None, str(error)
+
+
+def detect_technologies(response):
+    technologies = []
+
+    headers = {
+        key.lower(): value.lower()
+        for key, value in response.headers.items()
+    }
+
+    body = response.text.lower()
+
+    server = headers.get("server", "")
+    powered_by = headers.get("x-powered-by", "")
+
+    for name in (
+        "nginx",
+        "apache",
+        "iis",
+    ):
+        if name in server:
+            technologies.append(name)
+
+    if powered_by:
+        technologies.append(powered_by)
+
+    checks = {
+        "wordpress": [
+            "wp-content",
+            "wp-includes",
+        ],
+        "php": [
+            ".php",
+        ],
+        "django": [
+            "csrfmiddlewaretoken",
+            "django",
+        ],
+        "flask": [
+            "flask",
+        ],
+        "laravel": [
+            "laravel",
+        ],
+        "react": [
+            "react",
+        ],
+        "next.js": [
+            "__next",
+        ],
+        "vue": [
+            "vue",
+        ],
+        "jquery": [
+            "jquery",
+        ],
+    }
+
+    for technology, indicators in checks.items():
+        if any(
+            indicator in body
+            for indicator in indicators
+        ):
+            technologies.append(technology)
+
+    return sorted(set(technologies))
+
+
+def extract_title(response):
+    match = re.search(
+        r"<title[^>]*>(.*?)</title>",
+        response.text,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    if not match:
+        return ""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        match.group(1),
+    ).strip()
+
+
+def extract_links(response):
+    links = []
+    base = response.url
+
+    matches = re.findall(
+        r'href=["\']([^"\']+)["\']',
+        response.text,
+        re.IGNORECASE,
+    )
+
+    for match in matches:
+        absolute = urljoin(
+            base,
+            match,
+        )
+
+        parsed = urlparse(absolute)
+
+        if parsed.scheme not in (
+            "http",
+            "https",
+        ):
+            continue
+
+        if absolute not in links:
+            links.append(absolute)
+
+    return links[:100]
+
+
+def extract_scripts(response):
+    scripts = []
+
+    matches = re.findall(
+        r'<script[^>]+src=["\']([^"\']+)["\']',
+        response.text,
+        re.IGNORECASE,
+    )
+
+    for match in matches:
+        scripts.append(
+            urljoin(
+                response.url,
+                match,
+            )
+        )
+
+    return scripts[:100]
+
+
+def extract_forms(response):
+    forms = []
+
+    pattern = re.compile(
+        r"<form\b[^>]*>(.*?)</form>",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    for match in pattern.finditer(
+        response.text
+    ):
+        form_html = match.group(0)
+
+        action_match = re.search(
+            r'action=["\']([^"\']*)["\']',
+            form_html,
+            re.IGNORECASE,
+        )
+
+        method_match = re.search(
+            r'method=["\']([^"\']*)["\']',
+            form_html,
+            re.IGNORECASE,
+        )
+
+        action = (
+            action_match.group(1)
+            if action_match
+            else ""
+        )
+
+        method = (
+            method_match.group(1).upper()
+            if method_match
+            else "GET"
+        )
+
+        inputs = []
+
+        input_tags = re.findall(
+            r"<input\b[^>]*>",
+            form_html,
+            re.IGNORECASE,
+        )
+
+        for input_html in input_tags:
+
+            name_match = re.search(
+                r'name=["\']([^"\']*)["\']',
+                input_html,
+                re.IGNORECASE,
+            )
+
+            type_match = re.search(
+                r'type=["\']([^"\']*)["\']',
+                input_html,
+                re.IGNORECASE,
+            )
+
+            value_match = re.search(
+                r'value=["\']([^"\']*)["\']',
+                input_html,
+                re.IGNORECASE,
+            )
+
+            inputs.append(
+                {
+                    "name": (
+                        name_match.group(1)
+                        if name_match
+                        else ""
+                    ),
+                    "type": (
+                        type_match.group(1)
+                        if type_match
+                        else "text"
+                    ),
+                    "value": (
+                        value_match.group(1)
+                        if value_match
+                        else ""
+                    ),
+                }
+            )
+
+        forms.append(
+            {
+                "action": urljoin(
+                    response.url,
+                    action,
+                ),
+                "method": method,
+                "inputs": inputs,
+            }
+        )
+
+    return forms
+
+
+def extract_parameters(url):
+    parsed = urlparse(url)
+
+    parameters = {}
+
+    for key, values in parse_qs(
+        parsed.query,
+        keep_blank_values=True,
+    ).items():
+        parameters[key] = values
+
+    return parameters
+
+
+def extract_api_candidates(response):
+    candidates = set()
+
+    patterns = [
+        r'["\'](/api/[^"\']*)',
+        r'["\'](/api[^"\']*)',
+        r'["\'](/graphql[^"\']*)',
+        r'["\'](/swagger[^"\']*)',
+        r'["\'](/openapi[^"\']*)',
+        r'["\'](/v[0-9]+/[^"\']*)',
+    ]
+
+    for pattern in patterns:
+
+        matches = re.findall(
+            pattern,
+            response.text,
+            re.IGNORECASE,
+        )
+
+        for match in matches:
+            candidates.add(
+                urljoin(
+                    response.url,
+                    match,
+                )
+            )
+
+    return sorted(candidates)[:100]
+
+
+def check_paths(base_url, paths):
+    results = []
+
+    for path in paths:
+
+        target = urljoin(
+            base_url + "/",
+            path.lstrip("/"),
+        )
+
+        response, error = request(
+            target,
+            allow_redirects=False,
+        )
+
+        if error:
+            continue
+
+        if response.status_code == 404:
+            continue
+
+        results.append(
+            {
+                "path": path,
+                "url": target,
+                "status": response.status_code,
+                "length": len(
+                    response.content
+                ),
+                "content_type": response.headers.get(
+                    "Content-Type",
+                    "",
+                ),
+                "location": response.headers.get(
+                    "Location"
+                ),
+            }
+        )
+
+    return results
+
+
+def get_robots(base_url):
+    url = base_url + "/robots.txt"
+
+    response, error = request(url)
+
+    if error:
+        return {
+            "status": None,
+            "error": error,
+        }
+
+    return {
+        "status": response.status_code,
+        "content": (
+            response.text[:10000]
+            if response.status_code == 200
+            else ""
+        ),
+    }
+
+
+def get_sitemap(base_url):
+    url = base_url + "/sitemap.xml"
+
+    response, error = request(url)
+
+    if error:
+        return {
+            "status": None,
+            "error": error,
+        }
+
+    return {
+        "status": response.status_code,
+        "content": (
+            response.text[:10000]
+            if response.status_code == 200
+            else ""
+        ),
+    }
+
+
+def enumerate_web(url):
+    url = normalize_url(url)
+
+    result = {
+        "tool": "web_enum",
+        "url": url,
+        "success": False,
+    }
+
+    response, error = request(url)
+
+    if error:
+        result["error"] = error
+        return result
+
+    result.update(
+        {
+            "success": True,
+            "final_url": response.url,
+            "status": response.status_code,
+            "title": extract_title(response),
+            "server": response.headers.get(
+                "Server",
+                "",
+            ),
+            "content_type": response.headers.get(
+                "Content-Type",
+                "",
+            ),
+            "content_length": len(
+                response.content
+            ),
+            "technologies": detect_technologies(
+                response
+            ),
+            "headers": dict(response.headers),
+            "links": extract_links(
+                response
+            ),
+            "scripts": extract_scripts(
+                response
+            ),
+            "forms": extract_forms(
+                response
+            ),
+            "parameters": extract_parameters(
+                response.url
+            ),
+            "api_candidates": (
+                extract_api_candidates(
+                    response
+                )
+            ),
+            "robots": get_robots(url),
+            "sitemap": get_sitemap(url),
+            "interesting_paths": check_paths(
+                url,
+                COMMON_PATHS,
+            ),
+            "interesting_files": check_paths(
+                url,
+                COMMON_FILES,
+            ),
+        }
+    )
+
+    return result
+
+
+def main():
+    import json
+    import sys
+
+    if len(sys.argv) != 2:
+        print(
+            "Usage: "
+            "python -m tools.web_enum <URL>"
+        )
+        sys.exit(1)
+
+    result = enumerate_web(
+        sys.argv[1]
+    )
+
+    print(
+        json.dumps(
+            result,
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

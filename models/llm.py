@@ -1,7 +1,10 @@
+import json
+
 import boto3
 
 
 class LLM:
+
     def __init__(
         self,
         provider="bedrock",
@@ -16,7 +19,7 @@ class LLM:
                 "This cloud version uses Amazon Bedrock."
             )
 
-        self.model = model or "deepseek.v3.2"
+        self.model = model or "deepseek.v3-v1:0"
 
         self.client = boto3.client(
             "bedrock-runtime",
@@ -27,7 +30,10 @@ class LLM:
         self,
         prompt,
         system=None,
+        max_tokens=800,
+        temperature=0.2,
     ):
+
         messages = [
             {
                 "role": "user",
@@ -42,15 +48,71 @@ class LLM:
         kwargs = {
             "modelId": self.model,
             "messages": messages,
+            "inferenceConfig": {
+                "maxTokens": max_tokens,
+                "temperature": temperature,
+            },
         }
 
         if system:
+
             kwargs["system"] = [
                 {
                     "text": system
                 }
             ]
 
-        response = self.client.converse(**kwargs)
+        response = self.client.converse(
+            **kwargs
+        )
 
-        return response["output"]["message"]["content"][0]["text"]
+        return (
+            response["output"]
+            ["message"]
+            ["content"][0]
+            ["text"]
+        )
+
+    def generate_json(
+        self,
+        prompt,
+        system=None,
+        max_tokens=600,
+    ):
+
+        response = self.generate(
+            prompt=prompt,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=0.1,
+        )
+
+        response = response.strip()
+
+        # Remove Markdown JSON fences.
+        if response.startswith("```"):
+
+            response = response.replace(
+                "```json",
+                "",
+                1,
+            )
+
+            response = response.replace(
+                "```",
+                "",
+            )
+
+            response = response.strip()
+
+        try:
+
+            return json.loads(response)
+
+        except json.JSONDecodeError:
+
+            return {
+                "type": "final",
+                "answer": response,
+                "error": "Invalid JSON returned by model.",
+            }

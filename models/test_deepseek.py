@@ -22,7 +22,7 @@ def main():
 
     llm = LLM(
         provider="bedrock",
-        model="deepseek.v3.2",
+        model="deepseek.v3-v1:0",
     )
 
     question = """
